@@ -399,27 +399,83 @@ def fetch_financials_one_day(d: date):
             break
 
 # =====================================================
-# 実行
+# エラー記録用ヘルパー
+# =====================================================
+def log_failure(table_name, date_val, error_msg):
+    """失敗した日付と理由をDBに保存"""
+    try:
+        cur.execute(
+            f"INSERT OR REPLACE INTO {table_name} (Date, last_error, retry_count) VALUES (?, ?, COALESCE((SELECT retry_count FROM {table_name} WHERE Date=?), 0) + 1)",
+            (date_val, str(error_msg), date_val)
+        )
+        conn.commit()
+        print(f"  [ERROR LOGGED] {date_val}: {error_msg}")
+    except Exception as e:
+        print(f"  [CRITICAL] Failed to log error: {e}")
+
+# =====================================================
+# 実行 (修正版)
 # =====================================================
 def main():
     today = date.today()
 
+    # --- 株価データ収集 ---
     print("=== DAILY QUOTES ===")
     latest_price = get_latest_price_date()
-    start = latest_price + timedelta(days=1) if latest_price else today - timedelta(days=180)
-    for d in get_trading_days(start, today):
-        fetch_daily_quotes_one_day(d)
-        print("[PRICE]", d)
+    # 初回実行時は少し長めに取る (例: 1年前から)
+    start = latest_price + timedelta(days=1) if latest_price else today - timedelta(days=365)
+    
+    target_days = get_trading_days(start, today)
+    print(f"Fetching {len(target_days)} days...")
 
-    print("=== FINANCIALS ===")
+    for d in target_days:
+        try:
+            fetch_daily_quotes_one_day(d)
+            print(f"[PRICE] {d} - OK")
+            
+            # 成功したら失敗リストから削除（リトライ成功時用）
+            cur.execute("DELETE FROM failed_dates WHERE Date = ?", (d.strftime("%Y-%m-%d"),))
+            conn.commit()
+            
+        except Exception as e:
+            print(f"[PRICE] {d} - FAILED: {e}")
+            log_failure("failed_dates", d.strftime("%Y-%m-%d"), e)
+
+    # --- 財務データ収集 ---
+    print("\n=== FINANCIALS ===")
     latest_fin = get_latest_fin_date()
-    d = latest_fin + timedelta(days=1) if latest_fin else today - timedelta(days=365)
+    d = latest_fin + timedelta(days=1) if latest_fin else today - timedelta(days=365 * 2) # 財務は過去2年分くらい欲しい
+    
     while d <= today:
-        fetch_financials_one_day(d)
-        print("[FIN]", d)
+        try:
+            fetch_financials_one_day(d)
+            print(f"[FIN]   {d} - OK")
+            
+            # 成功したら失敗リストから削除
+            cur.execute("DELETE FROM financial_failed_dates WHERE DisclosedDate = ?", (d.strftime("%Y-%m-%d"),))
+            conn.commit()
+            
+        except Exception as e:
+            print(f"[FIN]   {d} - FAILED: {e}")
+            # financial_failed_dates テーブルのカラム名は DisclosedDate なので注意
+            # ただし log_failure は汎用的に作っているので、テーブル定義の Date カラム名を合わせるか、
+            # ここだけ個別SQLにする必要があります。
+            # 簡略化のため、failed_dates テーブルの定義を統一するか、以下のように個別処理します。
+            try:
+                d_str = d.strftime("%Y-%m-%d")
+                cur.execute(
+                    "INSERT OR REPLACE INTO financial_failed_dates (DisclosedDate, last_error, retry_count) VALUES (?, ?, COALESCE((SELECT retry_count FROM financial_failed_dates WHERE DisclosedDate=?), 0) + 1)",
+                    (d_str, str(e), d_str)
+                )
+                conn.commit()
+            except:
+                pass
+        
         d += timedelta(days=1)
 
-main()
-conn.close()
-print("ALL DONE")
-
+if __name__ == "__main__":
+    try:
+        main()
+    finally:
+        conn.close()
+        print("ALL DONE")
