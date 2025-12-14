@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Pick Buy Candidates (Fixed SQL Version)
-- 修正点: 全銘柄の「それぞれの最新決算」を取得するように変更
+Buy Candidates (Schema-less JSON Version)
+- SQLiteのJSON関数を使ってクエリ実行
 """
 
 import sqlite3
@@ -13,109 +13,120 @@ conn = sqlite3.connect(DB_PATH)
 conn.row_factory = sqlite3.Row
 cur = conn.cursor()
 
-# 株価は「市場全体の最新日」でOK（全銘柄の株価はその日に存在するため）
+# 最新日付の取得
 cur.execute("SELECT MAX(Date) FROM daily_quotes")
 latest_price_date = cur.fetchone()[0]
 print(f"Target Price Date: {latest_price_date}")
 
 # =========================
-# 銘柄抽出（修正版SQL）
+# JSON抽出用SQL
 # =========================
+# ポイント:
+# 1. json_extract(data, '$.KeyName') で値を取り出す
+# 2. 取り出した値は文字列扱いなので、CAST(... AS REAL) で数値化する
+# =========================
+
 sql = """
 WITH latest_fin AS (
-    -- 各銘柄ごとに、DisclosedDate が最も新しい行に rn=1 を振る
     SELECT 
-        *,
-        ROW_NUMBER() OVER (PARTITION BY LocalCode ORDER BY DisclosedDate DESC) as rn
+        Code,
+        data,
+        ROW_NUMBER() OVER (PARTITION BY Code ORDER BY Date DESC) as rn
     FROM financials
 ),
 target_price AS (
-    -- 指定した日付の株価のみ抽出
-    SELECT *
+    SELECT 
+        Code, 
+        data 
     FROM daily_quotes
     WHERE Date = ?
 )
 SELECT
-    f.LocalCode,
-    p.Close AS close_price,
-    p.Volume,
+    f.Code,
     
-    CAST(f.NetSales AS REAL) AS net_sales,
-    CAST(f.ForecastNetSales AS REAL) AS forecast_net_sales,
-    CAST(f.Profit AS REAL) AS profit,
-    CAST(f.Equity AS REAL) AS equity,
-    CAST(f.EarningsPerShare AS REAL) AS eps,
-    CAST(f.ForecastEarningsPerShare AS REAL) AS forecast_eps,
+    -- 株価データ (JSONから抽出)
+    CAST(json_extract(p.data, '$.Close') AS REAL) AS close_price,
+    CAST(json_extract(p.data, '$.Volume') AS REAL) AS volume,
+
+    -- 財務データ (JSONから抽出)
+    CAST(json_extract(f.data, '$.NetSales') AS REAL) AS net_sales,
+    CAST(json_extract(f.data, '$.ForecastNetSales') AS REAL) AS forecast_net_sales,
     
-    -- 指標計算 (ゼロ除算回避のためNULLチェック推奨だが簡易化)
-    (CAST(f.Profit AS REAL) / CAST(f.Equity AS REAL)) AS roe,
-    (p.Close / NULLIF(CAST(f.ForecastEarningsPerShare AS REAL), 0)) AS per
+    CAST(json_extract(f.data, '$.Profit') AS REAL) AS profit,
+    CAST(json_extract(f.data, '$.Equity') AS REAL) AS equity,
+    
+    CAST(json_extract(f.data, '$.EarningsPerShare') AS REAL) AS eps,
+    CAST(json_extract(f.data, '$.ForecastEarningsPerShare') AS REAL) AS forecast_eps
 
 FROM latest_fin f
 JOIN target_price p
-  ON f.LocalCode = p.Code
+  ON f.Code = p.Code
 WHERE
-    f.rn = 1  -- 各銘柄の最新決算のみを対象にする
+    f.rn = 1 -- 最新決算のみ
     
-    -- 以下、フィルタ条件
-    AND f.Profit IS NOT NULL AND CAST(f.Profit AS REAL) > 0
-    AND f.Equity IS NOT NULL AND CAST(f.Equity AS REAL) > 0
+    -- フィルタリング条件もJSON抽出値に対して行う
+    AND profit > 0
+    AND equity > 0
+    AND forecast_eps > 0
+    AND volume > 10000
     
-    -- EPS > 0
-    AND f.ForecastEarningsPerShare IS NOT NULL 
-    AND CAST(f.ForecastEarningsPerShare AS REAL) > 0
+    -- 売上維持率 > 95%
+    AND forecast_net_sales > net_sales * 0.95
     
-    -- 売上が大きく落ち込んでいない ( > 95%)
-    AND CAST(f.ForecastNetSales AS REAL) > CAST(f.NetSales AS REAL) * 0.95
+    -- ROE >= 8% (計算式)
+    AND (profit / equity) >= 0.08
     
-    -- 流動性 (Volume > 10,000)
-    AND CAST(p.Volume AS REAL) > 10000
-    
-    -- ROE >= 8%
-    AND (CAST(f.Profit AS REAL) / CAST(f.Equity AS REAL)) >= 0.08
-    
-    -- PER 5倍〜40倍
-    AND (p.Close / CAST(f.ForecastEarningsPerShare AS REAL)) BETWEEN 5 AND 40
+    -- PER 5~40倍
+    AND (close_price / forecast_eps) BETWEEN 5 AND 40
 """
 
-rows = cur.execute(sql, (latest_price_date,)).fetchall()
+try:
+    rows = cur.execute(sql, (latest_price_date,)).fetchall()
+except sqlite3.OperationalError as e:
+    print(f"SQL Error: {e}")
+    print("※ SQLiteのバージョンが古い可能性があります。Python 3.9以上推奨。")
+    exit()
 
 # =========================
-# スコアリング (変更なし)
+# スコアリング (ロジックは同じ)
 # =========================
 candidates = []
 for r in rows:
     try:
-        roe = r["roe"]
-        eps = r["eps"] or 0
-        forecast_eps = r["forecast_eps"]
-        volume = r["Volume"]
-
-        # EPS成長率
-        eps_growth = ((forecast_eps - eps) / abs(eps)) if eps > 0 else 0
+        # 既にSQLでCASTしているので、ここでは数値として扱える
+        close_price = r["close_price"]
+        roe = r["profit"] / r["equity"]
+        eps = r["eps"]
+        f_eps = r["forecast_eps"]
+        volume = r["volume"]
         
+        # EPS成長率
+        eps_growth = ((f_eps - eps) / abs(eps)) if eps > 0 else 0
+        
+        # PER
+        per = close_price / f_eps if f_eps > 0 else 0
+
         # 流動性スコア
         liquidity_score = math.log10(volume) if volume > 0 else 0
 
-        # 総合スコア
         score = (roe * 100 * 0.5) + (eps_growth * 100 * 0.3) + (liquidity_score * 10 * 0.2)
 
         candidates.append({
-            "code": r["LocalCode"],
-            "price": int(r["close_price"]),
+            "code": r["Code"],
+            "price": int(close_price),
             "roe": roe * 100,
-            "per": r["per"] if r["per"] else 0,
-            "eps": forecast_eps,
+            "per": per,
+            "eps": f_eps,
             "sales_growth": (r["forecast_net_sales"] / r["net_sales"] - 1) * 100,
             "score": score
         })
-    except Exception as e:
-        continue # 計算エラーの銘柄はスキップ
+    except Exception:
+        continue
 
 candidates.sort(key=lambda x: x["score"], reverse=True)
 
-print(f"\n=== BUY CANDIDATES ({len(candidates)} records found) ===")
-for c in candidates[:20]:
+print(f"\n=== BUY CANDIDATES ({len(candidates)} records) ===")
+for c in candidates[:50]:
     print(
         f"{c['code']} | "
         f"Price: {c['price']:6,} | "
